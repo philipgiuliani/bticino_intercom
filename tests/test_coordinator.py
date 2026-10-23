@@ -16,6 +16,7 @@ from custom_components.bticino_intercom.const import (
     CALL_RETRANSMIT_WINDOW,
     CALL_SESSION_MAX_DURATION,
     DATA_LAST_EVENT,
+    DATA_LAST_EVENTS_BY_MODULE,
     EVENT_CALL,
     EVENT_TYPE_ACCEPTED_CALL,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
@@ -27,13 +28,16 @@ from custom_components.bticino_intercom.const import (
 from custom_components.bticino_intercom.coordinator import (
     MAX_CONSECUTIVE_TRANSIENT_ERRORS,
     BticinoIntercomCoordinator,
+    merge_door_events,
 )
 
 from .conftest import (
     BRIDGE_MAC,
     DOORLOCK_ID,
     EXTERNAL_UNIT_2_ID,
+    EXTERNAL_UNIT_2_NAME,
     EXTERNAL_UNIT_ID,
+    EXTERNAL_UNIT_NAME,
     HOME_ID,
     SESSION_ID,
 )
@@ -1036,3 +1040,159 @@ class TestStatusPushWithoutRtcOffer:
 
         assert signals == []
         assert [event["module_id"] for event in events] == [DOORLOCK_ID]
+
+
+class TestPerDoorEventIndex:
+    """Status pushes must keep the outdoor station id the RTC offer recorded."""
+
+    async def test_status_without_offer_does_not_guess_among_doors(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+    ) -> None:
+        """Two stations and no offer: the bridge id stays, and no door is updated."""
+        await coordinator._process_websocket_event(ws_incoming_call)
+
+        assert coordinator.data[DATA_LAST_EVENT]["module_id"] == BRIDGE_MAC
+        bucket = coordinator.data.get(DATA_LAST_EVENTS_BY_MODULE, {})
+        assert EXTERNAL_UNIT_ID not in bucket
+        assert EXTERNAL_UNIT_2_ID not in bucket
+
+    async def test_single_station_status_is_attributed_to_that_door(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+    ) -> None:
+        """One outdoor station is unambiguous even when the push only names the bridge."""
+        del coordinator.data["modules"][EXTERNAL_UNIT_2_ID]
+
+        await coordinator._process_websocket_event(ws_incoming_call)
+
+        last = coordinator.data[DATA_LAST_EVENT]
+        assert last["module_id"] == EXTERNAL_UNIT_ID
+        assert last["module_name"] == EXTERNAL_UNIT_NAME
+        door = coordinator.data[DATA_LAST_EVENTS_BY_MODULE][EXTERNAL_UNIT_ID]
+        assert door["snapshot_url"] == "https://example.com/snapshot.jpg"
+
+    async def test_missed_call_keeps_the_door_and_its_snapshot(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_incoming_call: dict,
+        ws_missed_call: dict,
+    ) -> None:
+        """Ending the call must not replace the station id with the bridge MAC."""
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        await coordinator._process_websocket_event(ws_incoming_call)
+        await coordinator._process_websocket_event(ws_missed_call)
+
+        last = coordinator.data[DATA_LAST_EVENT]
+        assert last["type"] == EVENT_TYPE_MISSED_CALL
+        assert last["module_id"] == EXTERNAL_UNIT_ID
+        door = coordinator.data[DATA_LAST_EVENTS_BY_MODULE][EXTERNAL_UNIT_ID]
+        assert door["type"] == EVENT_TYPE_MISSED_CALL
+        assert door["snapshot_url"] == "https://example.com/snapshot.jpg"
+        assert door["module_name"] == EXTERNAL_UNIT_NAME
+        assert EXTERNAL_UNIT_2_ID not in coordinator.data[DATA_LAST_EVENTS_BY_MODULE]
+
+    async def test_incoming_call_history_is_stored_under_the_calling_door(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_incoming_call: dict,
+    ) -> None:
+        """The snapshot push names the bridge; the history record must name the door."""
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        coordinator.history = AsyncMock()
+        coordinator.history.async_record_call = AsyncMock(return_value={})
+
+        await coordinator._process_websocket_event(ws_incoming_call)
+
+        kwargs = coordinator.history.async_record_call.await_args.kwargs
+        assert kwargs["module_id"] == EXTERNAL_UNIT_ID
+        assert kwargs["module_name"] == EXTERNAL_UNIT_NAME
+        assert kwargs["snapshot_url"] == "https://example.com/snapshot.jpg"
+
+    async def test_second_door_does_not_replace_the_first(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_incoming_call: dict,
+    ) -> None:
+        """A later ring at another station leaves the first station's last event alone."""
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        await coordinator._process_websocket_event(ws_incoming_call)
+
+        second = {
+            "push_type": "BNC1-rtc",
+            "extra_params": {
+                "device_id": BRIDGE_MAC,
+                "session_id": "sess-other-door",
+                "data": {
+                    "type": "offer",
+                    "session_description": {
+                        "type": "call",
+                        "module_id": EXTERNAL_UNIT_2_ID,
+                        "sdp": "v=0\r\n",
+                    },
+                },
+            },
+        }
+        await coordinator._process_websocket_event(second)
+
+        bucket = coordinator.data[DATA_LAST_EVENTS_BY_MODULE]
+        assert bucket[EXTERNAL_UNIT_ID]["snapshot_url"] == "https://example.com/snapshot.jpg"
+        assert bucket[EXTERNAL_UNIT_2_ID]["type"] == EVENT_TYPE_INCOMING_CALL
+        assert bucket[EXTERNAL_UNIT_2_ID]["module_name"] == EXTERNAL_UNIT_2_NAME
+        assert coordinator.data[DATA_LAST_EVENT]["module_id"] == EXTERNAL_UNIT_2_ID
+
+    async def test_history_poll_assigns_a_bridge_record_to_the_named_door(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+    ) -> None:
+        """Event history's module id is applied to a record the push filed under the bridge."""
+        coordinator.history = AsyncMock()
+        coordinator.history.async_assign_module = AsyncMock(return_value=True)
+        events = [
+            {
+                "id": "evt_1",
+                "module_id": EXTERNAL_UNIT_ID,
+                "subevents": [{"type": "missed_call", "session_id": "sess-from-history"}],
+            }
+        ]
+
+        await coordinator._reconcile_history_doors(coordinator.data["modules"], events)
+
+        coordinator.history.async_assign_module.assert_awaited_once_with(
+            event_id="sess-from-history",
+            module_id=EXTERNAL_UNIT_ID,
+            module_name=EXTERNAL_UNIT_NAME,
+        )
+
+
+def test_merge_door_events_keeps_each_station_and_prefers_the_newer_copy() -> None:
+    """History backfills every door; a newer live event wins for that door only."""
+    modules = {
+        EXTERNAL_UNIT_ID: {"type": "BNEU", "variant": "BNEU:bneu_external_unit"},
+        EXTERNAL_UNIT_2_ID: {"type": "BNEU", "variant": "BNEU:bneu_external_unit"},
+        BRIDGE_MAC: {"type": "BNC1", "variant": "BNC1:bnc1_bridge"},
+    }
+    history = [
+        {"module_id": EXTERNAL_UNIT_ID, "time": 200, "type": "outdoor", "id": "from-history"},
+        {"module_id": EXTERNAL_UNIT_ID, "time": 50, "type": "outdoor", "id": "older"},
+        {"module_id": BRIDGE_MAC, "time": 999, "type": "connection"},
+    ]
+    live = {
+        EXTERNAL_UNIT_ID: {"module_id": EXTERNAL_UNIT_ID, "time": 100, "type": "incoming_call"},
+        EXTERNAL_UNIT_2_ID: {
+            "module_id": EXTERNAL_UNIT_2_ID,
+            "timestamp": datetime(2026, 1, 1, tzinfo=UTC),
+            "type": "incoming_call",
+        },
+    }
+
+    merged = merge_door_events(modules, history, live)
+
+    assert merged[EXTERNAL_UNIT_ID]["id"] == "from-history"
+    assert merged[EXTERNAL_UNIT_2_ID]["type"] == "incoming_call"
+    assert BRIDGE_MAC not in merged

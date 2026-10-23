@@ -150,6 +150,8 @@ class BticinoCallBinarySensor(BticinoEntity, BinarySensorEntity):
 
         attrs: dict[str, Any] = {
             "reachable": module_data.get("reachable"),
+            "module_id": self._module_id,
+            "module_name": self._attr_name,
         }
 
         # Add last call info from event history

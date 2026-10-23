@@ -3,12 +3,13 @@
 from homeassistant.components.event import DOMAIN as EVENT_DOMAIN
 from homeassistant.components.event import EventDeviceClass
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.bticino_intercom.const import SIGNAL_CALL_RECEIVED
+from custom_components.bticino_intercom.const import DOMAIN, SIGNAL_CALL_RECEIVED
 
-from .conftest import EXTERNAL_UNIT_ID
+from .conftest import EXTERNAL_UNIT_ID, EXTERNAL_UNIT_NAME
 
 
 async def test_event_entity_created(
@@ -67,3 +68,28 @@ async def test_event_has_doorbell_device_class(
     entity_id = states[0]
     state = hass.states.get(entity_id)
     assert state.attributes.get("device_class") == EventDeviceClass.DOORBELL
+
+
+async def test_event_identifies_its_door(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """The doorbell event carries the station id and name, before and during a ring."""
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(
+        EVENT_DOMAIN,
+        DOMAIN,
+        f"{mock_setup_entry.entry_id}_doorbell_event_{EXTERNAL_UNIT_ID}",
+    )
+    assert entity_id is not None
+    state = hass.states.get(entity_id)
+    assert state.attributes.get("module_id") == EXTERNAL_UNIT_ID
+    assert state.attributes.get("module_name") == EXTERNAL_UNIT_NAME
+
+    async_dispatcher_send(hass, SIGNAL_CALL_RECEIVED, True, EXTERNAL_UNIT_ID)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state.attributes.get("event_type") == "ring"
+    assert state.attributes.get("module_id") == EXTERNAL_UNIT_ID
+    assert state.attributes.get("module_name") == EXTERNAL_UNIT_NAME

@@ -25,6 +25,18 @@ _MODULE_TYPE_TO_SUBTYPE = {
 }
 
 
+def door_display_name(module_data: Mapping[str, Any] | None, module_id: str) -> str:
+    """Return the outdoor station name configured in the Home + Security app.
+
+    Falls back to a generic label when the topology has no distinct name,
+    so two unnamed stations do not share one entity name.
+    """
+    name = (module_data or {}).get("name")
+    if isinstance(name, str) and name and name != module_id:
+        return name
+    return f"Door {module_id}"
+
+
 def get_module_subtype(module_data: Mapping[str, Any]) -> str | None:
     """Return a module subtype from its variant or its known module type."""
     variant = module_data.get("variant")

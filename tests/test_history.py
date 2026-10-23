@@ -427,3 +427,41 @@ async def test_list_modules_empty_store(
         await store.async_load()
 
     assert store.list_modules() == []
+
+
+async def test_assign_module_moves_a_bridge_record_onto_the_door(
+    hass: HomeAssistant,
+    tmp_path,
+) -> None:
+    """A call filed under the bridge can be reassigned once history names the door."""
+    with patch.object(hass.config, "path", side_effect=lambda *parts: str(tmp_path.joinpath(*parts))):
+        store = EventHistoryStore(hass, "entry_assign")
+        await store.async_load()
+        await store.async_record_call(
+            event_id="sess-door",
+            module_id="00:03:50:d9:a6:3b",
+            module_name="Bridge",
+            snapshot_url=None,
+            vignette_url=None,
+        )
+
+        assert store.list_events(module_id="door-1") == []
+        moved = await store.async_assign_module(
+            event_id="sess-door",
+            module_id="door-1",
+            module_name="Haustür",
+        )
+        unchanged = await store.async_assign_module(
+            event_id="sess-door",
+            module_id="door-1",
+            module_name="Haustür",
+        )
+        missing = await store.async_assign_module(event_id="nope", module_id="door-1")
+
+    assert moved is True
+    assert unchanged is False
+    assert missing is False
+    events = store.list_events(module_id="door-1")
+    assert len(events) == 1
+    assert events[0]["module_name"] == "Haustür"
+    assert events[0]["event_id"] == "sess-door"
