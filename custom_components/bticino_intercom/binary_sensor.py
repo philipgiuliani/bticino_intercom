@@ -154,6 +154,7 @@ class BticinoCallBinarySensor(BticinoEntity, BinarySensorEntity):
             # the module lets a frontend pair this sensor with its camera:
             # every entity of the home shares the bridge device
             "module_id": self._module_id,
+            "module_name": self._attr_name,
             "reachable": module_data.get("reachable"),
         }
 

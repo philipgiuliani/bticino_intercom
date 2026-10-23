@@ -1,7 +1,7 @@
 """Platform for sensor integration."""
 
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 from homeassistant.components.sensor import (
@@ -18,13 +18,34 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.dt import utc_from_timestamp, utcnow
 
 from .const import (
+    DATA_LAST_EVENTS_BY_MODULE,
     DOMAIN,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
     EVENT_TYPE_TERMINATED,
+    SUBTYPE_EXTERNAL_UNIT,
 )
 from .coordinator import BticinoIntercomCoordinator
-from .utils import cleanup_orphaned_entities, format_timestamp_iso, format_uptime_readable
+from .entity import BticinoEntity
+from .utils import (
+    cleanup_orphaned_entities,
+    door_display_name,
+    format_timestamp_iso,
+    format_uptime_readable,
+    get_module_subtype,
+)
+
+# Event types that count as a ring / completed call for the per-door sensors.
+_CALL_EVENT_TYPES = frozenset(
+    {
+        "incoming_call",
+        "missed_call",
+        "accepted_call",
+        "terminated",
+        "answered_elsewhere",
+        "outdoor",
+    }
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,9 +70,16 @@ async def async_setup_entry(
     entities = []
 
     # --- Event Sensors (Re-linked to bridge device) ---
+    # The three sensors below stay global: they follow whichever door rang
+    # last, so existing automations keep working. Per-door copies are added
+    # next to them.
     entities.append(BticinoEventSensor(coordinator))
     entities.append(BticinoLastCallTimestampSensor(coordinator))
     entities.append(BticinoCallCountSensor(coordinator))
+    for module_id, module_data in coordinator.data.get("modules", {}).items():
+        if get_module_subtype(module_data) == SUBTYPE_EXTERNAL_UNIT:
+            entities.append(BticinoDoorEventSensor(coordinator, module_id))
+            entities.append(BticinoDoorLastRingSensor(coordinator, module_id))
 
     # --- Bridge Status Sensors (Keep as is) ---
     if bridge_module_data:
@@ -161,10 +189,13 @@ class BticinoEventSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEn
             vignette_url = vignette_data.get("url")
             vignette_expires_at_iso = format_timestamp_iso(vignette_data.get("expires_at"))
 
+        module_id = last_event.get("module_id")
         attrs = {
             "timestamp_iso": format_timestamp_iso(timestamp),
             "event_id": last_event.get("id"),
-            "event_module_id": last_event.get("module_id"),
+            "event_module_id": module_id,
+            "module_id": module_id,
+            "module_name": _resolved_module_name(self.coordinator, module_id, last_event.get("module_name")),
             # "subevent_type": first_subevent.get("type"), # State is now this
             "message": first_subevent.get("message"),
             "session_id": first_subevent.get("session_id"),
@@ -327,10 +358,13 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
             vignette_url = vignette_data.get("url")
             vignette_expires_at_iso = format_timestamp_iso(vignette_data.get("expires_at"))
 
+        module_id = event.get("module_id")
         attrs = {
             "call_event_id": event.get("id"),
             "call_event_time_iso": format_timestamp_iso(event.get("time")),
-            "call_module_id": event.get("module_id"),
+            "call_module_id": module_id,
+            "module_id": module_id,
+            "module_name": _resolved_module_name(self.coordinator, module_id, event.get("module_name")),
             "subevent_type": first_subevent.get("type"),
             "subevent_time_iso": format_timestamp_iso(first_subevent.get("time")),  # Same as native_value (ISO)
             "message": first_subevent.get("message"),
@@ -415,6 +449,229 @@ class BticinoCallCountSensor(CoordinatorEntity[BticinoIntercomCoordinator], Sens
             "answered": answered,
             "missed": missed,
         }
+
+
+def _first_subevent(event: dict[str, Any]) -> dict[str, Any]:
+    """Return the first subevent dict, or an empty dict."""
+    subevents = event.get("subevents")
+    if isinstance(subevents, list) and subevents and isinstance(subevents[0], dict):
+        return subevents[0]
+    return {}
+
+
+def _resolved_module_name(
+    coordinator: BticinoIntercomCoordinator,
+    module_id: str | None,
+    explicit: str | None = None,
+) -> str | None:
+    """Return a door name from the event, or look it up in the topology."""
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if not module_id or not coordinator.data:
+        return None
+    name = coordinator.data.get("modules", {}).get(module_id, {}).get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _event_images(event: dict[str, Any]) -> dict[str, Any]:
+    """Return snapshot/vignette fields from either a push or a history event."""
+    subevent = _first_subevent(event)
+    images: dict[str, Any] = {}
+    for kind in ("snapshot", "vignette"):
+        direct = event.get(f"{kind}_url")
+        nested = subevent.get(kind)
+        url = direct or (nested.get("url") if isinstance(nested, dict) else None)
+        if url:
+            images[f"{kind}_url"] = url
+        if isinstance(nested, dict) and nested.get("expires_at"):
+            images[f"{kind}_expires_at_iso"] = format_timestamp_iso(nested.get("expires_at"))
+    return images
+
+
+def _event_moment(event: dict[str, Any]) -> datetime | None:
+    """Return the best timestamp on an event as an aware datetime."""
+    subevent = _first_subevent(event)
+    for value in (subevent.get("time"), event.get("time"), event.get("timestamp")):
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            return utc_from_timestamp(value)
+    return None
+
+
+def _is_call_event(event: dict[str, Any]) -> bool:
+    """Return True when the event is a ring or the end of a call."""
+    if event.get("type") in _CALL_EVENT_TYPES:
+        return True
+    return _first_subevent(event).get("type") in _CALL_EVENT_TYPES
+
+
+def _event_type_of(event: dict[str, Any]) -> str | None:
+    """Return the specific type, preferring the first subevent."""
+    sub_type = _first_subevent(event).get("type")
+    if isinstance(sub_type, str) and sub_type:
+        return sub_type
+    main_type = event.get("type")
+    return main_type if isinstance(main_type, str) else None
+
+
+def _door_event(coordinator: BticinoIntercomCoordinator, module_id: str) -> dict[str, Any] | None:
+    """Return the latest known event for one outdoor station."""
+    if not coordinator.data:
+        return None
+    bucket = coordinator.data.get(DATA_LAST_EVENTS_BY_MODULE, {})
+    event = bucket.get(module_id) if isinstance(bucket, dict) else None
+    if isinstance(event, dict):
+        return event
+    history = coordinator.data.get("events_history", {}).get(coordinator.home_id, [])
+    if isinstance(history, list):
+        for item in history:
+            if isinstance(item, dict) and item.get("module_id") == module_id:
+                return item
+    last_event = coordinator.data.get("last_event") or {}
+    if isinstance(last_event, dict) and last_event.get("module_id") == module_id:
+        return last_event
+    return None
+
+
+def _event_type_icon(state: str | None) -> str:
+    """Return an icon for a call event type."""
+    if state in ("missed_call", EVENT_TYPE_TERMINATED):
+        return "mdi:phone-missed"
+    if state in ("accepted_call", EVENT_TYPE_ANSWERED_ELSEWHERE):
+        return "mdi:phone-check"
+    if state in ("incoming_call", EVENT_TYPE_INCOMING_CALL):
+        return "mdi:phone-incoming"
+    if state == "connection":
+        return "mdi:lan-connect"
+    if state == "disconnection":
+        return "mdi:lan-disconnect"
+    if state == "outdoor":
+        return "mdi:door"
+    return "mdi:history"
+
+
+class BticinoDoorEventSensor(BticinoEntity, SensorEntity):
+    """Last event type for a single outdoor station."""
+
+    def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str) -> None:
+        """Initialize the per-door event sensor."""
+        super().__init__(coordinator, module_id)
+        module_data = coordinator.data.get("modules", {}).get(module_id, {})
+        self._door_name = door_display_name(module_data, module_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{module_id}_last_event"
+        self._attr_name = f"{self._door_name} Last Event"
+        self._update_state()
+
+    @property
+    def available(self) -> bool:
+        """Stay available while the station is in the topology."""
+        return self.coordinator.last_update_success and self._module_id in (self.coordinator.data or {}).get(
+            "modules", {}
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_state()
+        super()._handle_coordinator_update()
+
+    def _update_state(self) -> None:
+        """Show the latest event that belongs to this door."""
+        event = _door_event(self.coordinator, self._module_id)
+        if not event:
+            # Online, but this station has not rung yet.
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {
+                "module_id": self._module_id,
+                "module_name": self._door_name,
+            }
+            return
+
+        subevent = _first_subevent(event)
+        self._attr_native_value = _event_type_of(event)
+        moment = _event_moment(event)
+        session_id = subevent.get("session_id") or event.get("session_id")
+        attrs: dict[str, Any] = {
+            "module_id": self._module_id,
+            "module_name": _resolved_module_name(self.coordinator, self._module_id, event.get("module_name"))
+            or self._door_name,
+            "timestamp_iso": format_timestamp_iso(moment),
+            "event_id": event.get("id") or event.get("event_id"),
+            "session_id": session_id,
+            "message": subevent.get("message"),
+        }
+        attrs.update(_event_images(event))
+        self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
+
+    @property
+    def icon(self) -> str | None:
+        """Return the icon for the current event type."""
+        state = self.native_value
+        return _event_type_icon(state if isinstance(state, str) else None)
+
+
+class BticinoDoorLastRingSensor(BticinoEntity, SensorEntity):
+    """Timestamp of the last ring at a single outdoor station."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:doorbell-video"
+
+    def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str) -> None:
+        """Initialize the per-door last-ring sensor."""
+        super().__init__(coordinator, module_id)
+        module_data = coordinator.data.get("modules", {}).get(module_id, {})
+        self._door_name = door_display_name(module_data, module_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{module_id}_last_ring"
+        self._attr_name = f"{self._door_name} Last Ring"
+        self._update_state()
+
+    @property
+    def available(self) -> bool:
+        """Stay available while the station is in the topology."""
+        return self.coordinator.last_update_success and self._module_id in (self.coordinator.data or {}).get(
+            "modules", {}
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_state()
+        super()._handle_coordinator_update()
+
+    def _update_state(self) -> None:
+        """Show when this door last rang."""
+        event = _door_event(self.coordinator, self._module_id)
+        if event is None or not _is_call_event(event):
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {
+                "module_id": self._module_id,
+                "module_name": self._door_name,
+            }
+            return
+
+        moment = _event_moment(event)
+        if moment is None:
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {
+                "module_id": self._module_id,
+                "module_name": self._door_name,
+            }
+            return
+
+        self._attr_native_value = moment
+        subevent = _first_subevent(event)
+        attrs: dict[str, Any] = {
+            "module_id": self._module_id,
+            "module_name": _resolved_module_name(self.coordinator, self._module_id, event.get("module_name"))
+            or self._door_name,
+            "event_type": _event_type_of(event),
+            "event_id": event.get("id") or event.get("event_id"),
+            "session_id": subevent.get("session_id") or event.get("session_id"),
+            "message": subevent.get("message"),
+        }
+        attrs.update(_event_images(event))
+        self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
 
 
 # --- New Bridge Status Sensors ---

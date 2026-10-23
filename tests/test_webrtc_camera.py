@@ -64,9 +64,12 @@ async def test_webrtc_camera_snapshot_entities(
 ) -> None:
     """Test that snapshot camera is created alongside WebRTC cameras."""
     states = hass.states.async_entity_ids(CAMERA_DOMAIN)
-    assert len(states) == 4  # snapshot + 2 webrtc + call_home
+    # global snapshot + 2 per-door snapshots + 2 webrtc + call_home
+    assert len(states) == 6
     names = {hass.states.get(s).attributes.get("friendly_name", "") for s in states}
-    assert any("Snapshot" in n for n in names)
+    assert any("Last Event Snapshot" in n for n in names)
+    assert any("Citofono Strada Last Snapshot" in n for n in names)
+    assert any("Citofono Ingresso Last Snapshot" in n for n in names)
 
 
 def _get_call_home_camera(hass):
