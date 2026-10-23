@@ -60,6 +60,8 @@ EVENT_CALL = f"{DOMAIN}_call"
 
 # Data keys for coordinator
 DATA_LAST_EVENT = "last_event"
+# Latest event per external unit (outdoor station). Keyed by module id.
+DATA_LAST_EVENTS_BY_MODULE = "last_events_by_module"
 
 # Coordinator update interval (in minutes)
 UPDATE_INTERVAL = 5

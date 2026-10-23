@@ -30,7 +30,15 @@ from custom_components.bticino_intercom.const import (
     EVENT_LOGBOOK_TERMINATED,
 )
 
-from .conftest import BRIDGE_MAC, EXT_UNIT_MODULE_ID, LIGHT_MODULE_ID, LOCK_MODULE_ID
+from .conftest import (
+    BRIDGE_MAC,
+    EXT_UNIT_MODULE_ID,
+    EXTERNAL_UNIT_2_ID,
+    EXTERNAL_UNIT_2_NAME,
+    EXTERNAL_UNIT_NAME,
+    LIGHT_MODULE_ID,
+    LOCK_MODULE_ID,
+)
 
 # ---------------------------------------------------------------------------
 # Device & Entity Registry
@@ -543,7 +551,13 @@ async def test_websocket_event_updates_camera_url(
 ) -> None:
     """Test that a new websocket event updates the camera snapshot URL."""
     coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
-    snapshot_id = next(s for s in hass.states.async_entity_ids(CAMERA_DOMAIN) if "snapshot" in s)
+    registry = er.async_get(hass)
+    snapshot_id = registry.async_get_entity_id(
+        CAMERA_DOMAIN,
+        DOMAIN,
+        f"{mock_setup_entry.entry_id}_last_snapshot",
+    )
+    assert snapshot_id is not None
 
     old_url = hass.states.get(snapshot_id).attributes.get("image_url")
     assert old_url == "https://example.com/snapshot.jpg"
@@ -573,6 +587,60 @@ async def test_websocket_event_updates_camera_url(
 
     new_url = hass.states.get(snapshot_id).attributes.get("image_url")
     assert new_url == "https://example.com/new_snapshot.jpg"
+    assert hass.states.get(snapshot_id).attributes.get("module_id") == EXT_UNIT_MODULE_ID
+
+
+async def test_per_door_snapshot_cameras_keep_their_own_image(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Each outdoor station has a snapshot that does not follow the other door."""
+    registry = er.async_get(hass)
+
+    def _camera(unique_id: str) -> str:
+        entity_id = registry.async_get_entity_id(CAMERA_DOMAIN, DOMAIN, unique_id)
+        assert entity_id is not None, unique_id
+        return entity_id
+
+    entry_id = mock_setup_entry.entry_id
+    strada = _camera(f"{entry_id}_{EXT_UNIT_MODULE_ID}_last_snapshot")
+    ingresso = _camera(f"{entry_id}_{EXTERNAL_UNIT_2_ID}_last_snapshot")
+    whole_home = _camera(f"{entry_id}_last_snapshot")
+
+    strada_state = hass.states.get(strada)
+    ingresso_state = hass.states.get(ingresso)
+    assert strada_state.attributes.get("image_url") == "https://example.com/snapshot.jpg"
+    assert strada_state.attributes.get("module_id") == EXT_UNIT_MODULE_ID
+    assert strada_state.attributes.get("module_name") == EXTERNAL_UNIT_NAME
+    assert "image_url" not in ingresso_state.attributes
+    assert ingresso_state.attributes.get("module_id") == EXTERNAL_UNIT_2_ID
+    assert ingresso_state.attributes.get("module_name") == EXTERNAL_UNIT_2_NAME
+    assert hass.states.get(whole_home).attributes.get("module_name") == EXTERNAL_UNIT_NAME
+
+    coordinator = hass.data[DOMAIN][entry_id]["coordinator"]
+    await coordinator._process_websocket_event(
+        {
+            "push_type": "BNC1-rtc",
+            "extra_params": {
+                "device_id": BRIDGE_MAC,
+                "session_id": "sess_ingresso_cam",
+                "data": {
+                    "type": "offer",
+                    "session_description": {
+                        "type": "call",
+                        "module_id": EXTERNAL_UNIT_2_ID,
+                        "sdp": "v=0\r\n",
+                    },
+                },
+            },
+        }
+    )
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(strada).attributes.get("image_url") == "https://example.com/snapshot.jpg"
+    assert hass.states.get(ingresso).attributes.get("module_id") == EXTERNAL_UNIT_2_ID
+    assert hass.states.get(whole_home).attributes.get("module_id") == EXTERNAL_UNIT_2_ID
 
 
 # ---------------------------------------------------------------------------

@@ -240,6 +240,34 @@ class EventHistoryStore:
 
             await self._persist_locked()
 
+    async def async_assign_module(
+        self,
+        *,
+        event_id: str,
+        module_id: str,
+        module_name: str | None = None,
+    ) -> bool:
+        """Move an existing record onto the outdoor station that owned the call.
+
+        Status pushes that arrive without an RTC offer are stored under the
+        bridge MAC. Event history later names the external unit via
+        ``module_id`` and the same session id. Image files stay where they
+        were downloaded; only the record's module id changes, which is what
+        per-door lookups filter on.
+
+        Returns True when a record was updated.
+        """
+        async with self._lock:
+            record = next((e for e in self._events if e.get("event_id") == event_id), None)
+            if record is None or record.get("module_id") == module_id:
+                return False
+            record["module_id"] = module_id
+            if module_name:
+                record["module_name"] = module_name
+            await self._persist_locked()
+            _LOGGER.info("Assigned history event %s to module %s", event_id, module_id)
+            return True
+
     async def async_apply_retention(
         self,
         *,

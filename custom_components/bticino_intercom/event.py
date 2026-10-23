@@ -1,7 +1,7 @@
 """Platform for doorbell event integration."""
 
 import logging
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from homeassistant.components.event import DoorbellEventType, EventDeviceClass, EventEntity
 from homeassistant.config_entries import ConfigEntry
@@ -47,14 +47,32 @@ class BticinoDoorbellEvent(BticinoEntity, EventEntity):
         super().__init__(coordinator, module_id)
         self._attr_unique_id = f"{coordinator.entry.entry_id}_doorbell_event_{module_id}"
         module_data = coordinator.data.get("modules", {}).get(module_id, {})
-        self._attr_name = module_data.get("name") or "Doorbell"
+        self._door_name = module_data.get("name") or "Doorbell"
+        self._attr_name = self._door_name
+        # Present before the first ring, so an automation can read which door
+        # this entity belongs to without waiting for an event.
+        self._attr_extra_state_attributes = {
+            "module_id": module_id,
+            "module_name": self._door_name,
+        }
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return door identity plus the event platform's own attributes."""
+        attributes = dict(super().extra_state_attributes)
+        attributes["module_id"] = self._module_id
+        attributes["module_name"] = self._door_name
+        return attributes
 
     @callback
     def _handle_call_received(self, state: bool, module_id: str | None) -> None:
         """Handle the dispatcher signal for incoming calls."""
         if module_id == self._module_id and state:
             _LOGGER.debug("Doorbell event triggered for %s", self.entity_id)
-            self._trigger_event(DoorbellEventType.RING, {"module_id": module_id})
+            self._trigger_event(
+                DoorbellEventType.RING,
+                {"module_id": module_id, "module_name": self._door_name},
+            )
             self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:

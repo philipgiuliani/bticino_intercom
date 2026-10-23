@@ -24,9 +24,9 @@ from homeassistant.util.dt import utc_from_timestamp, utcnow
 from pybticino import AsyncAccount, SignalingClient
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
-from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
+from .const import DATA_LAST_EVENTS_BY_MODULE, DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
 from .coordinator import BticinoIntercomCoordinator
-from .utils import cleanup_orphaned_entities, format_timestamp_iso, get_module_subtype
+from .utils import cleanup_orphaned_entities, door_display_name, format_timestamp_iso, get_module_subtype
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,13 +63,15 @@ async def async_setup_entry(
 
     entities: list[Camera] = [BticinoSnapshotCamera(coordinator)]
 
-    # Create one WebRTC camera per external unit (BNEU module)
+    # Create one WebRTC camera and one last-snapshot camera per external unit.
     external_units = [
         (mid, mdata)
         for mid, mdata in coordinator.data.get("modules", {}).items()
         if get_module_subtype(mdata) == SUBTYPE_EXTERNAL_UNIT
     ]
     for mid, mdata in external_units:
+        door_name = door_display_name(mdata, mid)
+        entities.append(BticinoDoorSnapshotCamera(coordinator, mid, door_name))
         entities.append(
             BticinoWebRTCCamera(
                 coordinator,
@@ -100,18 +102,25 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         self,
         coordinator: BticinoIntercomCoordinator,
         image_type: str,  # 'snapshot' or 'vignette'
+        *,
+        door_module_id: str | None = None,
     ) -> None:
         """Initialize the base event camera."""
         super().__init__(coordinator)
         Camera.__init__(self)  # Initialize base Camera class
         self._image_type = image_type
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_last_{image_type}"
+        self._door_module_id = door_module_id
+        if door_module_id:
+            self._attr_unique_id = f"{coordinator.entry.entry_id}_{door_module_id}_last_{image_type}"
+        else:
+            self._attr_unique_id = f"{coordinator.entry.entry_id}_last_{image_type}"
         # Set name in subclasses
         self._image_url: str | None = None
         self._image_expires_at: datetime | None = None
         self._event_time: datetime | None = None
         self._cached_image: bytes | None = None
         self._cached_image_time: datetime | None = None
+        self._last_event_module_id: str | None = door_module_id
         self._last_event_module_name: str | None = None
         self._update_state()  # Initial update
 
@@ -137,6 +146,12 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
     @property
     def available(self) -> bool:
         """Return True if the coordinator succeeded and we have something to show."""
+        if self._door_module_id:
+            # A per-door camera stays available before the first ring so it can
+            # be targeted by automations and picture cards.
+            return self.coordinator.last_update_success and self._door_module_id in self.coordinator.data.get(
+                "modules", {}
+            )
         if not self.coordinator.last_update_success:
             return False
         if self._image_url is not None or self._cached_image is not None:
@@ -151,6 +166,8 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
             "image_url": self._image_url,
             "expires_at_iso": format_timestamp_iso(self._image_expires_at),
             "event_time_iso": format_timestamp_iso(self._event_time),
+            "module_id": self._last_event_module_id,
+            "module_name": self._last_event_module_name,
         }
         return {k: v for k, v in attrs.items() if v is not None}
 
@@ -193,28 +210,63 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
 
         return None, None, event_time_ts
 
-    def _update_state_internal(self) -> None:
-        """Update internal state variables from coordinator data."""
-        image_url = None
-        expires_at_ts = None
-        event_time_ts = None
+    def _history_events(self) -> list[Any]:
+        """Return API event history for this home, newest first."""
+        if not self.coordinator.data:
+            return []
+        events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
+        return events if isinstance(events, list) else []
 
-        last_event = self.coordinator.data.get("last_event")
+    def _lookup_module_name(self, module_id: str | None) -> str | None:
+        """Return the topology name for a module id."""
+        if not module_id or not self.coordinator.data:
+            return None
+        name = self.coordinator.data.get("modules", {}).get(module_id, {}).get("name")
+        return name if isinstance(name, str) and name else None
+
+    def _event_for_state(self) -> dict[str, Any] | None:
+        """Return the event this camera should display."""
+        data = self.coordinator.data or {}
+        if self._door_module_id:
+            bucket = data.get(DATA_LAST_EVENTS_BY_MODULE, {})
+            event = bucket.get(self._door_module_id) if isinstance(bucket, dict) else None
+            if isinstance(event, dict):
+                return event
+            for event in self._history_events():
+                if isinstance(event, dict) and event.get("module_id") == self._door_module_id:
+                    return event
+            return None
+
+        last_event = data.get("last_event")
         if last_event:
-            image_url, expires_at_ts, event_time_ts = self._extract_image_from_event(last_event)
-            # Store the module name for voice-only placeholder generation
-            self._last_event_module_name = last_event.get("module_name")
-
+            return last_event
         # Only fall back to API event history if there's no active/recent call.
         # When a call is active, showing an old snapshot from a different
         # module would be misleading.
-        if not image_url and not last_event:
-            events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
-            for event in events:
-                url, exp, evt_time = self._extract_image_from_event(event)
-                if url:
-                    image_url, expires_at_ts, event_time_ts = url, exp, evt_time
-                    break
+        for event in self._history_events():
+            if not isinstance(event, dict):
+                continue
+            url, _, _ = self._extract_image_from_event(event)
+            if url:
+                return event
+        return None
+
+    def _update_state_internal(self) -> None:
+        """Update internal state variables from coordinator data."""
+        event = self._event_for_state()
+        image_url = None
+        expires_at_ts = None
+        event_time_ts = None
+        if event:
+            image_url, expires_at_ts, event_time_ts = self._extract_image_from_event(event)
+            module_id = event.get("module_id") or self._door_module_id
+            self._last_event_module_id = module_id if isinstance(module_id, str) else self._door_module_id
+            self._last_event_module_name = event.get("module_name") or self._lookup_module_name(
+                self._last_event_module_id
+            )
+        elif not self._door_module_id:
+            self._last_event_module_id = None
+            self._last_event_module_name = None
 
         self._image_url = image_url
         self._image_expires_at = (
@@ -255,7 +307,10 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         if store is None:
             return None
 
-        events = store.list_events(limit=1)
+        if self._door_module_id:
+            events = store.list_events(module_id=self._door_module_id, limit=1)
+        else:
+            events = store.list_events(limit=1)
         if not events:
             return None
 
@@ -273,13 +328,36 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
 
 
 class BticinoSnapshotCamera(BticinoBaseEventCamera):
-    """Representation of the Last Event Snapshot Camera."""
+    """Representation of the Last Event Snapshot Camera.
+
+    One entity for the whole home: it follows whichever outdoor station rang
+    last. Per-door pictures are ``BticinoDoorSnapshotCamera``.
+    """
 
     _attr_name = "Last Event Snapshot"
 
     def __init__(self, coordinator: BticinoIntercomCoordinator) -> None:
         """Initialize the snapshot camera."""
         super().__init__(coordinator, image_type="snapshot")
+
+
+class BticinoDoorSnapshotCamera(BticinoBaseEventCamera):
+    """Still image of the last ring at one outdoor station.
+
+    Named after the station (``Haustür Last Snapshot``). A ring at another
+    door does not replace this picture.
+    """
+
+    def __init__(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        module_id: str,
+        module_name: str,
+    ) -> None:
+        """Initialize the per-door snapshot camera."""
+        super().__init__(coordinator, image_type="snapshot", door_module_id=module_id)
+        self._attr_name = f"{module_name} Last Snapshot"
+        self._last_event_module_name = module_name
 
 
 class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera):
