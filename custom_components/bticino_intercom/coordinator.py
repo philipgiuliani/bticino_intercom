@@ -756,7 +756,25 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             )
         return None
 
-    def _status_subject(self, device_id: str | None, *, door_id: str | None = None) -> tuple[str | None, str | None]:
+    def _door_from_last_event(self, session_id: str | None) -> str | None:
+        """Return the outdoor station already recorded for this session."""
+        if not session_id:
+            return None
+        last = (self.data or {}).get(DATA_LAST_EVENT) or {}
+        if last.get("session_id") != session_id:
+            return None
+        module_id = last.get("module_id")
+        if _is_external_unit((self.data or {}).get("modules", {}), module_id):
+            return module_id
+        return None
+
+    def _status_subject(
+        self,
+        device_id: str | None,
+        *,
+        door_id: str | None = None,
+        allow_guess: bool = True,
+    ) -> tuple[str | None, str | None]:
         """Return ``(module_id, name)`` a status push should be attributed to.
 
         Status pushes carry the bridge MAC in ``device_id``. The outdoor
@@ -764,9 +782,13 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         module from the preceding RTC offer, or the only external unit when
         the home has just one. With several stations and no offer the bridge
         id is kept: the push does not say which door rang.
+
+        ``allow_guess`` is false once the call is already over. Guessing then
+        would warn that several stations are present, which is exactly the
+        late ``accepted_call`` / ``missed_call`` that follows a rescind.
         """
         modules = (self.data or {}).get("modules", {})
-        resolved = door_id or self._resolve_calling_module()
+        resolved = door_id or (self._resolve_calling_module() if allow_guess else None)
         subject_id = resolved or device_id
         name = module_name(modules, subject_id) or module_name(modules, device_id) or subject_id
         return subject_id, name
@@ -884,7 +906,12 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # outdoor station. Use the same id for the history record so the
             # snapshot lands on that door even when this push creates the record.
             announced_by_rtc_offer = bool(self._active_call)
-            module_id, subject_name = self._status_subject(device_id, door_id=calling_module_id)
+            session_closed = bool(session_id) and self._is_session_recently_closed(session_id)
+            # A late snapshot push still names the unit (one resolve) and fires
+            # the ring event so the call sensor can keep the picture. It must
+            # not turn the sensor back on: that signal is skipped below.
+            ring_module = calling_module_id or self._resolve_calling_module()
+            module_id, subject_name = self._status_subject(device_id, door_id=ring_module, allow_guess=False)
             record_module = module_id or device_id
             event_id = session_id or f"{now_ts}-{record_module}"
 
@@ -935,17 +962,16 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # Whether an RTC offer preceded this push decides who has already
             # announced the ring: the offer path dispatches the signal itself,
             # so re-sending it there would only restart the auto-off timer.
-            calling_module_id = calling_module_id or self._resolve_calling_module()
-            if calling_module_id:
-                if not announced_by_rtc_offer and not self._is_session_recently_closed(extra_params.get("session_id")):
+            if ring_module:
+                if not announced_by_rtc_offer and not session_closed:
                     # No offer arrived, so this push is the only notice of the
                     # ring we will get — without this the binary_sensor and the
                     # event entity never fire at all (#67, #58).
-                    self._answered_modules.discard(calling_module_id)
-                    async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, True, calling_module_id)
+                    self._answered_modules.discard(ring_module)
+                    async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, True, ring_module)
                 self._fire_call_event(
                     "ring",
-                    calling_module_id,
+                    ring_module,
                     snapshot_url=snapshot_url,
                     vignette_url=vignette_url,
                     session_id=extra_params.get("session_id"),
@@ -967,8 +993,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             # Turn off binary sensor — device_id here is the bridge MAC, not the
             # external unit module_id, so resolve the unit that rang.
-            module_id, subject_name = self._status_subject(device_id, door_id=calling_module_id)
             calling_module = None if call_was_over else (calling_module_id or self._resolve_calling_module())
+            known_door = calling_module or (self._door_from_last_event(session_id) if call_was_over else None)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door, allow_guess=False)
             if calling_module:
                 async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module)
             self._active_call = None
@@ -995,11 +1022,13 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # the WebRTC session may still be active on another device. When
             # the rescind came first, the call is already over and its
             # entities are off.
-            module_id, subject_name = self._status_subject(device_id, door_id=calling_module_id)
-            if not self._is_session_recently_closed(extra_params.get("session_id")):
-                answered = calling_module_id or self._resolve_calling_module()
-                if answered:
-                    self.mark_call_answered(answered)
+            session_id = extra_params.get("session_id")
+            recently_closed = self._is_session_recently_closed(session_id)
+            answered = None if recently_closed else (calling_module_id or self._resolve_calling_module())
+            if answered:
+                self.mark_call_answered(answered)
+            known_door = answered or (self._door_from_last_event(session_id) if recently_closed else None)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door, allow_guess=False)
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_ACCEPTED_CALL,
