@@ -220,11 +220,6 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
 
         return None, None, event_time_ts
 
-    def _history_events(self) -> list[Any]:
-        """Return API event history for this home, newest first."""
-        events = (self.coordinator.data or {}).get("events_history", {}).get(self.coordinator.home_id) or []
-        return events if isinstance(events, list) else []
-
     def _event_for_state(self) -> dict[str, Any] | None:
         """Return the event this camera should display."""
         data = self.coordinator.data or {}
@@ -237,9 +232,8 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         # Only fall back to API event history if there's no active/recent call.
         # When a call is active, showing an old snapshot from a different
         # module would be misleading.
-        for event in self._history_events():
-            if not isinstance(event, dict):
-                continue
+        events = data.get("events_history", {}).get(self.coordinator.home_id, [])
+        for event in events:
             url, _, _ = self._extract_image_from_event(event)
             if url:
                 return event

@@ -768,28 +768,15 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             return module_id
         return None
 
-    def _status_subject(
-        self,
-        device_id: str | None,
-        *,
-        door_id: str | None = None,
-        allow_guess: bool = True,
-    ) -> tuple[str | None, str | None]:
+    def _status_subject(self, device_id: str | None, *, door_id: str | None = None) -> tuple[str | None, str | None]:
         """Return ``(module_id, name)`` a status push should be attributed to.
 
-        Status pushes carry the bridge MAC in ``device_id``. The outdoor
-        station is an explicit id (a test ring that names the entrance), the
-        module from the preceding RTC offer, or the only external unit when
-        the home has just one. With several stations and no offer the bridge
-        id is kept: the push does not say which door rang.
-
-        ``allow_guess`` is false once the call is already over. Guessing then
-        would warn that several stations are present, which is exactly the
-        late ``accepted_call`` / ``missed_call`` that follows a rescind.
+        Status pushes carry the bridge MAC in ``device_id``. ``door_id`` is
+        the outdoor station when the caller has already resolved it. The push
+        itself never says which door rang, so an unknown door keeps the bridge.
         """
         modules = (self.data or {}).get("modules", {})
-        resolved = door_id or (self._resolve_calling_module() if allow_guess else None)
-        subject_id = resolved or device_id
+        subject_id = door_id or device_id
         name = module_name(modules, subject_id) or module_name(modules, device_id) or subject_id
         return subject_id, name
 
@@ -911,7 +898,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # the ring event so the call sensor can keep the picture. It must
             # not turn the sensor back on: that signal is skipped below.
             ring_module = calling_module_id or self._resolve_calling_module()
-            module_id, subject_name = self._status_subject(device_id, door_id=ring_module, allow_guess=False)
+            module_id, subject_name = self._status_subject(device_id, door_id=ring_module)
             record_module = module_id or device_id
             event_id = session_id or f"{now_ts}-{record_module}"
 
@@ -995,7 +982,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # external unit module_id, so resolve the unit that rang.
             calling_module = None if call_was_over else (calling_module_id or self._resolve_calling_module())
             known_door = calling_module or (self._door_from_last_event(session_id) if call_was_over else None)
-            module_id, subject_name = self._status_subject(device_id, door_id=known_door, allow_guess=False)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door)
             if calling_module:
                 async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module)
             self._active_call = None
@@ -1028,7 +1015,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             if answered:
                 self.mark_call_answered(answered)
             known_door = answered or (self._door_from_last_event(session_id) if recently_closed else None)
-            module_id, subject_name = self._status_subject(device_id, door_id=known_door, allow_guess=False)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door)
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_ACCEPTED_CALL,

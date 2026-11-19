@@ -553,6 +553,19 @@ class BticinoPerDoorSensor(BticinoEntity, SensorEntity):
         )
         return {"module_id": self._module_id, "module_name": name}
 
+    def _attributes(self, event: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        """Return the attributes both per-door sensors share."""
+        subevent = _first_subevent(event)
+        attrs: dict[str, Any] = {
+            **self._identity(event),
+            "event_id": event.get("id") or event.get("event_id"),
+            "session_id": subevent.get("session_id") or event.get("session_id"),
+            "message": subevent.get("message"),
+            **extra,
+        }
+        attrs.update(_event_images(event))
+        return {k: v for k, v in attrs.items() if v is not None}
+
     def _update_state(self) -> None:
         """Subclasses fill the state from this door's latest event."""
         raise NotImplementedError
@@ -572,17 +585,10 @@ class BticinoDoorEventSensor(BticinoPerDoorSensor):
             self._clear()
             return
 
-        subevent = _first_subevent(event)
         self._attr_native_value = _event_type_of(event)
-        attrs: dict[str, Any] = {
-            **self._identity(event),
-            "timestamp_iso": format_timestamp_iso(_event_moment(event)),
-            "event_id": event.get("id") or event.get("event_id"),
-            "session_id": subevent.get("session_id") or event.get("session_id"),
-            "message": subevent.get("message"),
-        }
-        attrs.update(_event_images(event))
-        self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
+        self._attr_extra_state_attributes = self._attributes(
+            event, timestamp_iso=format_timestamp_iso(_event_moment(event))
+        )
 
     @property
     def icon(self) -> str | None:
@@ -609,17 +615,8 @@ class BticinoDoorLastRingSensor(BticinoPerDoorSensor):
             self._clear()
             return
 
-        subevent = _first_subevent(event)
         self._attr_native_value = moment
-        attrs: dict[str, Any] = {
-            **self._identity(event),
-            "event_type": _event_type_of(event),
-            "event_id": event.get("id") or event.get("event_id"),
-            "session_id": subevent.get("session_id") or event.get("session_id"),
-            "message": subevent.get("message"),
-        }
-        attrs.update(_event_images(event))
-        self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
+        self._attr_extra_state_attributes = self._attributes(event, event_type=_event_type_of(event))
 
 
 # --- New Bridge Status Sensors ---
