@@ -18,14 +18,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.dt import utc_from_timestamp, utcnow
 
 from .const import (
-    DATA_LAST_EVENTS_BY_MODULE,
     DOMAIN,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
     EVENT_TYPE_TERMINATED,
     SUBTYPE_EXTERNAL_UNIT,
 )
-from .coordinator import BticinoIntercomCoordinator
+from .coordinator import BticinoIntercomCoordinator, door_last_event
 from .entity import BticinoEntity
 from .utils import (
     cleanup_orphaned_entities,
@@ -33,6 +32,7 @@ from .utils import (
     format_timestamp_iso,
     format_uptime_readable,
     get_module_subtype,
+    module_name,
 )
 
 # Event types that count as a ring / completed call for the per-door sensors.
@@ -195,7 +195,8 @@ class BticinoEventSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEn
             "event_id": last_event.get("id"),
             "event_module_id": module_id,
             "module_id": module_id,
-            "module_name": _resolved_module_name(self.coordinator, module_id, last_event.get("module_name")),
+            "module_name": last_event.get("module_name")
+            or module_name(self.coordinator.data.get("modules"), module_id),
             # "subevent_type": first_subevent.get("type"), # State is now this
             "message": first_subevent.get("message"),
             "session_id": first_subevent.get("session_id"),
@@ -364,7 +365,7 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
             "call_event_time_iso": format_timestamp_iso(event.get("time")),
             "call_module_id": module_id,
             "module_id": module_id,
-            "module_name": _resolved_module_name(self.coordinator, module_id, event.get("module_name")),
+            "module_name": event.get("module_name") or module_name(self.coordinator.data.get("modules"), module_id),
             "subevent_type": first_subevent.get("type"),
             "subevent_time_iso": format_timestamp_iso(first_subevent.get("time")),  # Same as native_value (ISO)
             "message": first_subevent.get("message"),
@@ -459,20 +460,6 @@ def _first_subevent(event: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _resolved_module_name(
-    coordinator: BticinoIntercomCoordinator,
-    module_id: str | None,
-    explicit: str | None = None,
-) -> str | None:
-    """Return a door name from the event, or look it up in the topology."""
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    if not module_id or not coordinator.data:
-        return None
-    name = coordinator.data.get("modules", {}).get(module_id, {}).get("name")
-    return name if isinstance(name, str) and name else None
-
-
 def _event_images(event: dict[str, Any]) -> dict[str, Any]:
     """Return snapshot/vignette fields from either a push or a history event."""
     subevent = _first_subevent(event)
@@ -508,30 +495,7 @@ def _is_call_event(event: dict[str, Any]) -> bool:
 
 def _event_type_of(event: dict[str, Any]) -> str | None:
     """Return the specific type, preferring the first subevent."""
-    sub_type = _first_subevent(event).get("type")
-    if isinstance(sub_type, str) and sub_type:
-        return sub_type
-    main_type = event.get("type")
-    return main_type if isinstance(main_type, str) else None
-
-
-def _door_event(coordinator: BticinoIntercomCoordinator, module_id: str) -> dict[str, Any] | None:
-    """Return the latest known event for one outdoor station."""
-    if not coordinator.data:
-        return None
-    bucket = coordinator.data.get(DATA_LAST_EVENTS_BY_MODULE, {})
-    event = bucket.get(module_id) if isinstance(bucket, dict) else None
-    if isinstance(event, dict):
-        return event
-    history = coordinator.data.get("events_history", {}).get(coordinator.home_id, [])
-    if isinstance(history, list):
-        for item in history:
-            if isinstance(item, dict) and item.get("module_id") == module_id:
-                return item
-    last_event = coordinator.data.get("last_event") or {}
-    if isinstance(last_event, dict) and last_event.get("module_id") == module_id:
-        return last_event
-    return None
+    return _first_subevent(event).get("type") or event.get("type")
 
 
 def _event_type_icon(state: str | None) -> str:
@@ -551,16 +515,15 @@ def _event_type_icon(state: str | None) -> str:
     return "mdi:history"
 
 
-class BticinoDoorEventSensor(BticinoEntity, SensorEntity):
-    """Last event type for a single outdoor station."""
+class BticinoPerDoorSensor(BticinoEntity, SensorEntity):
+    """A sensor scoped to one outdoor station."""
 
-    def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str) -> None:
-        """Initialize the per-door event sensor."""
+    def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str, suffix: str, label: str) -> None:
+        """Initialize the per-door sensor."""
         super().__init__(coordinator, module_id)
-        module_data = coordinator.data.get("modules", {}).get(module_id, {})
-        self._door_name = door_display_name(module_data, module_id)
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_{module_id}_last_event"
-        self._attr_name = f"{self._door_name} Last Event"
+        self._door_name = door_display_name(self._module_data, module_id)
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{module_id}_{suffix}"
+        self._attr_name = f"{self._door_name} {label}"
         self._update_state()
 
     @property
@@ -576,29 +539,46 @@ class BticinoDoorEventSensor(BticinoEntity, SensorEntity):
         self._update_state()
         super()._handle_coordinator_update()
 
+    def _clear(self) -> None:
+        """Show no event yet, while keeping the door identity."""
+        self._attr_native_value = None
+        self._attr_extra_state_attributes = {"module_id": self._module_id, "module_name": self._door_name}
+
+    def _identity(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Return module id and the best name we have for this door."""
+        name = (
+            event.get("module_name")
+            or module_name((self.coordinator.data or {}).get("modules"), self._module_id)
+            or self._door_name
+        )
+        return {"module_id": self._module_id, "module_name": name}
+
+    def _update_state(self) -> None:
+        """Subclasses fill the state from this door's latest event."""
+        raise NotImplementedError
+
+
+class BticinoDoorEventSensor(BticinoPerDoorSensor):
+    """Last event type for a single outdoor station."""
+
+    def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str) -> None:
+        """Initialize the per-door event sensor."""
+        super().__init__(coordinator, module_id, "last_event", "Last Event")
+
     def _update_state(self) -> None:
         """Show the latest event that belongs to this door."""
-        event = _door_event(self.coordinator, self._module_id)
+        event = door_last_event(self.coordinator.data, self.coordinator.home_id, self._module_id)
         if not event:
-            # Online, but this station has not rung yet.
-            self._attr_native_value = None
-            self._attr_extra_state_attributes = {
-                "module_id": self._module_id,
-                "module_name": self._door_name,
-            }
+            self._clear()
             return
 
         subevent = _first_subevent(event)
         self._attr_native_value = _event_type_of(event)
-        moment = _event_moment(event)
-        session_id = subevent.get("session_id") or event.get("session_id")
         attrs: dict[str, Any] = {
-            "module_id": self._module_id,
-            "module_name": _resolved_module_name(self.coordinator, self._module_id, event.get("module_name"))
-            or self._door_name,
-            "timestamp_iso": format_timestamp_iso(moment),
+            **self._identity(event),
+            "timestamp_iso": format_timestamp_iso(_event_moment(event)),
             "event_id": event.get("id") or event.get("event_id"),
-            "session_id": session_id,
+            "session_id": subevent.get("session_id") or event.get("session_id"),
             "message": subevent.get("message"),
         }
         attrs.update(_event_images(event))
@@ -611,7 +591,7 @@ class BticinoDoorEventSensor(BticinoEntity, SensorEntity):
         return _event_type_icon(state if isinstance(state, str) else None)
 
 
-class BticinoDoorLastRingSensor(BticinoEntity, SensorEntity):
+class BticinoDoorLastRingSensor(BticinoPerDoorSensor):
     """Timestamp of the last ring at a single outdoor station."""
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -619,52 +599,20 @@ class BticinoDoorLastRingSensor(BticinoEntity, SensorEntity):
 
     def __init__(self, coordinator: BticinoIntercomCoordinator, module_id: str) -> None:
         """Initialize the per-door last-ring sensor."""
-        super().__init__(coordinator, module_id)
-        module_data = coordinator.data.get("modules", {}).get(module_id, {})
-        self._door_name = door_display_name(module_data, module_id)
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_{module_id}_last_ring"
-        self._attr_name = f"{self._door_name} Last Ring"
-        self._update_state()
-
-    @property
-    def available(self) -> bool:
-        """Stay available while the station is in the topology."""
-        return self.coordinator.last_update_success and self._module_id in (self.coordinator.data or {}).get(
-            "modules", {}
-        )
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self._update_state()
-        super()._handle_coordinator_update()
+        super().__init__(coordinator, module_id, "last_ring", "Last Ring")
 
     def _update_state(self) -> None:
         """Show when this door last rang."""
-        event = _door_event(self.coordinator, self._module_id)
-        if event is None or not _is_call_event(event):
-            self._attr_native_value = None
-            self._attr_extra_state_attributes = {
-                "module_id": self._module_id,
-                "module_name": self._door_name,
-            }
+        event = door_last_event(self.coordinator.data, self.coordinator.home_id, self._module_id)
+        moment = _event_moment(event) if event and _is_call_event(event) else None
+        if event is None or moment is None:
+            self._clear()
             return
 
-        moment = _event_moment(event)
-        if moment is None:
-            self._attr_native_value = None
-            self._attr_extra_state_attributes = {
-                "module_id": self._module_id,
-                "module_name": self._door_name,
-            }
-            return
-
-        self._attr_native_value = moment
         subevent = _first_subevent(event)
+        self._attr_native_value = moment
         attrs: dict[str, Any] = {
-            "module_id": self._module_id,
-            "module_name": _resolved_module_name(self.coordinator, self._module_id, event.get("module_name"))
-            or self._door_name,
+            **self._identity(event),
             "event_type": _event_type_of(event),
             "event_id": event.get("id") or event.get("event_id"),
             "session_id": subevent.get("session_id") or event.get("session_id"),

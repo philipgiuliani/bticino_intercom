@@ -31,9 +31,9 @@ try:  # Home Assistant 2026.11 and later
 except ImportError:  # older releases have no native two-way audio
     CameraEntityCapabilities = None
 
-from .const import DATA_LAST_EVENTS_BY_MODULE, DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
-from .coordinator import BticinoIntercomCoordinator
-from .utils import cleanup_orphaned_entities, door_display_name, format_timestamp_iso, get_module_subtype
+from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
+from .coordinator import BticinoIntercomCoordinator, door_last_event
+from .utils import cleanup_orphaned_entities, door_display_name, format_timestamp_iso, get_module_subtype, module_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,10 +122,8 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         Camera.__init__(self)  # Initialize base Camera class
         self._image_type = image_type
         self._door_module_id = door_module_id
-        if door_module_id:
-            self._attr_unique_id = f"{coordinator.entry.entry_id}_{door_module_id}_last_{image_type}"
-        else:
-            self._attr_unique_id = f"{coordinator.entry.entry_id}_last_{image_type}"
+        suffix = f"{door_module_id}_last_{image_type}" if door_module_id else f"last_{image_type}"
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{suffix}"
         # Set name in subclasses
         self._image_url: str | None = None
         self._image_expires_at: datetime | None = None
@@ -224,30 +222,14 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
 
     def _history_events(self) -> list[Any]:
         """Return API event history for this home, newest first."""
-        if not self.coordinator.data:
-            return []
-        events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
+        events = (self.coordinator.data or {}).get("events_history", {}).get(self.coordinator.home_id) or []
         return events if isinstance(events, list) else []
-
-    def _lookup_module_name(self, module_id: str | None) -> str | None:
-        """Return the topology name for a module id."""
-        if not module_id or not self.coordinator.data:
-            return None
-        name = self.coordinator.data.get("modules", {}).get(module_id, {}).get("name")
-        return name if isinstance(name, str) and name else None
 
     def _event_for_state(self) -> dict[str, Any] | None:
         """Return the event this camera should display."""
         data = self.coordinator.data or {}
         if self._door_module_id:
-            bucket = data.get(DATA_LAST_EVENTS_BY_MODULE, {})
-            event = bucket.get(self._door_module_id) if isinstance(bucket, dict) else None
-            if isinstance(event, dict):
-                return event
-            for event in self._history_events():
-                if isinstance(event, dict) and event.get("module_id") == self._door_module_id:
-                    return event
-            return None
+            return door_last_event(data, self.coordinator.home_id, self._door_module_id)
 
         last_event = data.get("last_event")
         if last_event:
@@ -271,10 +253,9 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         event_time_ts = None
         if event:
             image_url, expires_at_ts, event_time_ts = self._extract_image_from_event(event)
-            module_id = event.get("module_id") or self._door_module_id
-            self._last_event_module_id = module_id if isinstance(module_id, str) else self._door_module_id
-            self._last_event_module_name = event.get("module_name") or self._lookup_module_name(
-                self._last_event_module_id
+            self._last_event_module_id = event.get("module_id") or self._door_module_id
+            self._last_event_module_name = event.get("module_name") or module_name(
+                (self.coordinator.data or {}).get("modules"), self._last_event_module_id
             )
         elif not self._door_module_id:
             self._last_event_module_id = None

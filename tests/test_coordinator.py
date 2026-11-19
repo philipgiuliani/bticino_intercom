@@ -19,6 +19,8 @@ from custom_components.bticino_intercom.const import (
     DATA_LAST_EVENT,
     DATA_LAST_EVENTS_BY_MODULE,
     EVENT_CALL,
+    EVENT_LOGBOOK_INCOMING_CALL,
+    EVENT_LOGBOOK_MISSED_CALL,
     EVENT_TYPE_ACCEPTED_CALL,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
@@ -1618,6 +1620,50 @@ class TestPerDoorEventIndex:
             module_id=EXTERNAL_UNIT_ID,
             module_name=EXTERNAL_UNIT_NAME,
         )
+
+    async def test_status_logbook_keeps_the_bridge_id_and_names_the_door(
+        self,
+        hass: HomeAssistant,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_incoming_call: dict,
+        ws_missed_call: dict,
+    ) -> None:
+        """Status logbook events still carry the bridge id, plus the door when known."""
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        incoming = async_capture_events(hass, EVENT_LOGBOOK_INCOMING_CALL)
+        missed = async_capture_events(hass, EVENT_LOGBOOK_MISSED_CALL)
+
+        await coordinator._process_websocket_event(ws_incoming_call)
+        await coordinator._process_websocket_event(ws_missed_call)
+        await hass.async_block_till_done()
+
+        assert incoming[0].data == {
+            "name": "Incoming Call (BTicino Intercom)",
+            "module_id": BRIDGE_MAC,
+            "door_id": EXTERNAL_UNIT_ID,
+            "door_name": EXTERNAL_UNIT_NAME,
+        }
+        assert missed[0].data["module_id"] == BRIDGE_MAC
+        assert missed[0].data["door_id"] == EXTERNAL_UNIT_ID
+        assert missed[0].data["door_name"] == EXTERNAL_UNIT_NAME
+
+    async def test_status_logbook_without_a_known_door_matches_the_old_payload(
+        self,
+        hass: HomeAssistant,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+    ) -> None:
+        """Two stations and no offer: the payload is still just the bridge id."""
+        events = async_capture_events(hass, EVENT_LOGBOOK_INCOMING_CALL)
+
+        await coordinator._process_websocket_event(ws_incoming_call)
+        await hass.async_block_till_done()
+
+        assert events[0].data == {
+            "name": "Incoming Call (BTicino Intercom)",
+            "module_id": BRIDGE_MAC,
+        }
 
 
 def test_merge_door_events_keeps_each_station_and_prefers_the_newer_copy() -> None:

@@ -33,6 +33,13 @@ _SUBTYPE_ALIASES = {
 }
 
 
+def module_name(modules: Mapping[str, Any] | None, module_id: str | None) -> str | None:
+    """Return the name the cloud gave a module, or None when it sent none."""
+    if not module_id or not modules:
+        return None
+    return (modules.get(module_id) or {}).get("name") or None
+
+
 def door_display_name(module_data: Mapping[str, Any] | None, module_id: str) -> str:
     """Return the outdoor station name configured in the Home + Security app.
 
@@ -40,7 +47,7 @@ def door_display_name(module_data: Mapping[str, Any] | None, module_id: str) -> 
     so two unnamed stations do not share one entity name.
     """
     name = (module_data or {}).get("name")
-    if isinstance(name, str) and name and name != module_id:
+    if name and name != module_id:
         return name
     return f"Door {module_id}"
 

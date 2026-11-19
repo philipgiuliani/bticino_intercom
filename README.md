@@ -99,6 +99,8 @@ The integration fires these events on the Home Assistant bus, for automations an
 
 The `bticino_intercom.reject_call` action ends the ringing call on every device.
 
+On a status push (`incoming_call`, `missed_call`, `accepted_call`), `module_id` stays the bridge id from the cloud, which is what existing automations match. When the outdoor station is known, the same event also includes `door_id` and `door_name`. RTC logbook events already put the calling station in `module_id`.
+
 ### Automation Blueprints
 
 Ready-to-use blueprints for common intercom automations. Click a button to import directly into your Home Assistant:
