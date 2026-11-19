@@ -21,6 +21,7 @@ from .const import (
     CALL_SESSION_MAX_DURATION,
     CLOSED_SESSION_DEDUP_WINDOW,
     DATA_LAST_EVENT,
+    DATA_LAST_EVENTS_BY_MODULE,
     DEFAULT_NAME,
     DOMAIN,
     EVENT_CALL,
@@ -42,13 +43,103 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .history import EventHistoryStore
-from .utils import get_module_subtype
+from .utils import get_module_subtype, module_name
 
 # After this many consecutive transient API failures, raise UpdateFailed
 # instead of returning stale data, so entities are properly marked unavailable.
 MAX_CONSECUTIVE_TRANSIENT_ERRORS = 3
 
 _LOGGER = logging.getLogger(__name__)
+
+# Image fields worth keeping on a door's last event when a later push for the
+# same call (terminate, missed, accepted) does not repeat them.
+_DOOR_IMAGE_KEYS = ("snapshot_url", "vignette_url")
+
+
+def _event_recency(event: dict[str, Any]) -> float:
+    """Return the newest timestamp carried by an event, or 0."""
+    values: list[float] = []
+    subevents = event.get("subevents")
+    first: dict[str, Any] = {}
+    if isinstance(subevents, list) and subevents and isinstance(subevents[0], dict):
+        first = subevents[0]
+    for value in (first.get("time"), event.get("time"), event.get("timestamp")):
+        if isinstance(value, datetime):
+            values.append(value.timestamp())
+        elif isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            values.append(float(value))
+    return max(values) if values else 0.0
+
+
+def _history_session_ids(event: dict[str, Any]) -> list[str]:
+    """Return session ids declared on an API history event."""
+    found: list[str] = []
+    session_id = event.get("session_id")
+    if session_id:
+        found.append(session_id)
+    for subevent in event.get("subevents") or []:
+        if not isinstance(subevent, dict):
+            continue
+        sub_session = subevent.get("session_id")
+        if sub_session and sub_session not in found:
+            found.append(sub_session)
+    return found
+
+
+def _is_external_unit(modules: dict[str, Any], module_id: str | None) -> bool:
+    """Return True when ``module_id`` is an outdoor station in this topology."""
+    if not module_id:
+        return False
+    return get_module_subtype(modules.get(module_id) or {}) == SUBTYPE_EXTERNAL_UNIT
+
+
+def merge_door_events(
+    modules: dict[str, Any],
+    history_events: list[Any],
+    live: dict[str, Any],
+) -> dict[str, Any]:
+    """Index the latest event of each external unit.
+
+    History backfills every station. A live event replaces that station's
+    row when it is at least as recent, so a ring that has not reached
+    ``getevents`` yet survives the next poll.
+    """
+    merged: dict[str, Any] = {}
+
+    def consider(module_id: str | None, event: dict[str, Any], *, keep_tie: bool) -> None:
+        if not _is_external_unit(modules, module_id):
+            return
+        current = merged.get(module_id)
+        if current is None:
+            merged[module_id] = event
+            return
+        new_time = _event_recency(event)
+        old_time = _event_recency(current)
+        if new_time > old_time or (keep_tie and new_time == old_time):
+            merged[module_id] = event
+
+    for event in history_events:
+        if isinstance(event, dict):
+            consider(event.get("module_id"), event, keep_tie=False)
+    for module_id, event in live.items():
+        consider(module_id, event, keep_tie=True)
+    return merged
+
+
+def door_last_event(data: dict[str, Any] | None, home_id: str, module_id: str) -> dict[str, Any] | None:
+    """Return the newest event known for one outdoor station."""
+    if not data:
+        return None
+    event = (data.get(DATA_LAST_EVENTS_BY_MODULE) or {}).get(module_id)
+    if event:
+        return event
+    for item in (data.get("events_history") or {}).get(home_id) or []:
+        if isinstance(item, dict) and item.get("module_id") == module_id:
+            return item
+    last_event = data.get(DATA_LAST_EVENT) or {}
+    if last_event.get("module_id") == module_id:
+        return last_event
+    return None
 
 
 class BticinoIntercomCoordinator(DataUpdateCoordinator):
@@ -80,6 +171,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             "homes": {},
             "modules": {},
             DATA_LAST_EVENT: {},
+            DATA_LAST_EVENTS_BY_MODULE: {},
             "events_history": {},
         }
         self.home_id: str = entry.data["home_id"]
@@ -273,17 +365,24 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("Failed to fetch events for home %s: %s", self.home_id, err)
                 events_history_data[self.home_id] = []
 
+            history_events = events_history_data.get(self.home_id, [])
             try:
-                await self._backfill_history(events_history_data[self.home_id], modules_data)
+                await self._backfill_history(history_events, modules_data)
             except Exception:
                 # History is a convenience; never let it fail the poll.
                 _LOGGER.exception("Failed to backfill call history from polled events")
+            await self._reconcile_history_doors(modules_data, history_events)
 
             final_data = {
                 "homes": homes_data,
                 "modules": modules_data,
                 "events_history": events_history_data,
                 DATA_LAST_EVENT: self.data.get(DATA_LAST_EVENT, {}),
+                DATA_LAST_EVENTS_BY_MODULE: merge_door_events(
+                    modules_data,
+                    history_events,
+                    self.data.get(DATA_LAST_EVENTS_BY_MODULE, {}),
+                ),
             }
 
             if "name" in final_data["homes"][self.home_id]:
@@ -346,23 +445,19 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
     ) -> None:
         """Fire a bticino_intercom_call event for frontend/automations."""
         session_id = session_id or (self._active_call.get("session_id") if self._active_call else None)
-        module_name = None
+        resolved_name = None
         camera_entity_id = None
 
         if module_id:
-            modules = self.data.get("modules", {}) if self.data else {}
-            module_name = modules.get(module_id, {}).get("name", module_id)
-            ent_reg = er.async_get(self.hass)
-            for entry in er.async_entries_for_config_entry(ent_reg, self.entry.entry_id):
-                if entry.domain == "camera" and entry.unique_id and module_id in entry.unique_id:
-                    camera_entity_id = entry.entity_id
-                    break
+            modules = (self.data or {}).get("modules", {})
+            resolved_name = module_name(modules, module_id) or module_id
+            camera_entity_id = self._camera_entity_id(module_id)
 
         data: dict[str, Any] = {
             "type": event_type,
             "entry_id": self.entry.entry_id,
             "module_id": module_id,
-            "module_name": module_name,
+            "module_name": resolved_name,
             "session_id": session_id,
         }
         if event_type == "ring":
@@ -373,6 +468,19 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             data["reason"] = reason
 
         self.hass.bus.async_fire(EVENT_CALL, data)
+
+    def _camera_entity_id(self, module_id: str) -> str | None:
+        """Return this station's live camera, or its last-snapshot camera."""
+        registry = er.async_get(self.hass)
+        entry_id = self.entry.entry_id
+        for unique_id in (
+            f"{entry_id}_webrtc_{module_id}",
+            f"{entry_id}_{module_id}_last_snapshot",
+        ):
+            entity_id = registry.async_get_entity_id("camera", DOMAIN, unique_id)
+            if entity_id:
+                return entity_id
+        return None
 
     async def _process_websocket_event(self, message: dict[str, Any]) -> bool:
         """Process event data from websocket and update self.data.
@@ -648,6 +756,104 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             )
         return None
 
+    def _door_from_last_event(self, session_id: str | None) -> str | None:
+        """Return the outdoor station already recorded for this session."""
+        if not session_id:
+            return None
+        last = (self.data or {}).get(DATA_LAST_EVENT) or {}
+        if last.get("session_id") != session_id:
+            return None
+        module_id = last.get("module_id")
+        if _is_external_unit((self.data or {}).get("modules", {}), module_id):
+            return module_id
+        return None
+
+    def _status_subject(self, device_id: str | None, *, door_id: str | None = None) -> tuple[str | None, str | None]:
+        """Return ``(module_id, name)`` a status push should be attributed to.
+
+        Status pushes carry the bridge MAC in ``device_id``. ``door_id`` is
+        the outdoor station when the caller has already resolved it. The push
+        itself never says which door rang, so an unknown door keeps the bridge.
+        """
+        modules = (self.data or {}).get("modules", {})
+        subject_id = door_id or device_id
+        name = module_name(modules, subject_id) or module_name(modules, device_id) or subject_id
+        return subject_id, name
+
+    def _remember_door_event(self, event: dict[str, Any]) -> None:
+        """Index ``event`` under its outdoor station, keeping same-call images.
+
+        A missed or accepted push does not repeat the snapshot URL. The copy
+        stays on the per-door record, not on the whole-home ``last_event``.
+        """
+        subject_id = event.get("module_id")
+        modules = (self.data or {}).get("modules", {})
+        if not _is_external_unit(modules, subject_id):
+            return
+        if not event.get("module_name"):
+            name = module_name(modules, subject_id)
+            if name:
+                event["module_name"] = name
+        bucket = self.data.setdefault(DATA_LAST_EVENTS_BY_MODULE, {})
+        previous = bucket.get(subject_id) or {}
+        session_id = event.get("session_id")
+        stored = event
+        if previous and previous is not event and session_id and session_id == previous.get("session_id"):
+            stored = dict(event)
+            for key in _DOOR_IMAGE_KEYS:
+                if not stored.get(key) and previous.get(key):
+                    stored[key] = previous[key]
+        bucket[subject_id] = stored
+
+    def _fire_status_logbook(
+        self,
+        event_type: str,
+        label: str,
+        device_id: str | None,
+        door_id: str | None,
+        door_name: str | None,
+    ) -> None:
+        """Fire a status logbook event.
+
+        ``module_id`` stays the id from the push (the bridge). Existing
+        automations match that. ``door_id`` is the outdoor station when an
+        offer, or a home with one station, identifies it.
+        """
+        modules = (self.data or {}).get("modules", {})
+        shown = module_name(modules, device_id) or device_id
+        data: dict[str, Any] = {"name": f"{label} ({shown})", "module_id": device_id}
+        if _is_external_unit(modules, door_id):
+            data["door_id"] = door_id
+            if door_name:
+                data["door_name"] = door_name
+        self.hass.bus.async_fire(event_type, data)
+
+    async def _reconcile_history_doors(self, modules: dict[str, Any], events: list[Any]) -> None:
+        """Point locally stored calls at the door the event history names.
+
+        A status push without an RTC offer is filed under the bridge. The next
+        ``getevents`` response names the station (``module_id`` plus the
+        subevent ``session_id``). Image files stay where they were downloaded.
+        """
+        if self.history is None:
+            return
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            door_id = event.get("module_id")
+            if not _is_external_unit(modules, door_id):
+                continue
+            name = module_name(modules, door_id)
+            for session_id in _history_session_ids(event):
+                try:
+                    await self.history.async_assign_module(
+                        event_id=session_id,
+                        module_id=door_id,
+                        module_name=name,
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to assign history event %s to module %s", session_id, door_id)
+
     async def _process_status_event(
         self,
         message: dict[str, Any],
@@ -672,7 +878,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             return False
 
         device_id = extra_params.get("device_id")
-        device_name = self.data.get("modules", {}).get(device_id, {}).get("name", device_id)
+        device_name = module_name((self.data or {}).get("modules"), device_id) or device_id
 
         if event_type == "incoming_call":
             _LOGGER.info("Incoming call status event (with snapshot) for %s", device_name)
@@ -680,67 +886,85 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             snapshot_url = extra_params.get("snapshot_url")
             vignette_url = extra_params.get("vignette_url")
             timestamp = extra_params.get("timestamp")
+            session_id = extra_params.get("session_id")
             now_ts = int(datetime.now(UTC).timestamp())
-            # Use the same event_id logic as the RTC offer handler so the
-            # incoming_call push updates the record created by the offer.
-            calling_module = self._active_call.get("module_id") if self._active_call else None
-            record_module = calling_module or device_id
-            event_id = extra_params.get("session_id") or f"{now_ts}-{record_module}"
+            # Resolve the door before touching last_event. Status pushes carry
+            # the bridge MAC; the offer that usually precedes them recorded the
+            # outdoor station. Use the same id for the history record so the
+            # snapshot lands on that door even when this push creates the record.
+            announced_by_rtc_offer = bool(self._active_call)
+            session_closed = bool(session_id) and self._is_session_recently_closed(session_id)
+            # A late snapshot push still names the unit (one resolve) and fires
+            # the ring event so the call sensor can keep the picture. It must
+            # not turn the sensor back on: that signal is skipped below.
+            ring_module = calling_module_id or self._resolve_calling_module()
+            module_id, subject_name = self._status_subject(device_id, door_id=ring_module)
+            record_module = module_id or device_id
+            event_id = session_id or f"{now_ts}-{record_module}"
 
             # Download images to local storage BEFORE firing events,
             # so automations/notifications have images available immediately.
-            if record_history and self.history is not None and device_id:
+            if record_history and self.history is not None and record_module:
                 await self.history.async_record_call(
                     event_id=event_id,
-                    module_id=device_id,
-                    module_name=device_name,
+                    module_id=record_module,
+                    module_name=subject_name,
                     snapshot_url=snapshot_url,
                     vignette_url=vignette_url,
                     event_timestamp=now_ts,
                 )
 
-            last_event = self.data.get(DATA_LAST_EVENT, {})
-            if last_event and last_event.get("type") == EVENT_TYPE_INCOMING_CALL:
+            last_event = self.data.get(DATA_LAST_EVENT) or {}
+            same_session = bool(session_id) and last_event.get("session_id") == session_id
+            # A newer call at the same door (different session) must not inherit
+            # this snapshot, and a snapshot must not be written onto another door.
+            session_conflict = (
+                bool(session_id) and bool(last_event.get("session_id")) and last_event.get("session_id") != session_id
+            )
+            same_door = bool(module_id) and last_event.get("module_id") == module_id and not session_conflict
+            if last_event.get("type") == EVENT_TYPE_INCOMING_CALL and (same_session or same_door):
                 last_event["snapshot_url"] = snapshot_url
                 last_event["vignette_url"] = vignette_url
+                if module_id:
+                    last_event["module_id"] = module_id
+                    last_event["module_name"] = subject_name
+                if session_id and not last_event.get("session_id"):
+                    last_event["session_id"] = session_id
+                self.data[DATA_LAST_EVENT] = last_event
                 _LOGGER.info("Enriched existing call event with snapshot/vignette from incoming_call push")
             else:
                 self.data[DATA_LAST_EVENT] = {
                     "type": EVENT_TYPE_INCOMING_CALL,
                     "timestamp": datetime.now(UTC),
                     "time": timestamp,
-                    "module_id": device_id,
-                    "module_name": device_name,
-                    "session_id": extra_params.get("session_id"),
+                    "module_id": record_module,
+                    "module_name": subject_name,
+                    "session_id": session_id,
                     "event_id": event_id,
                     "snapshot_url": snapshot_url,
                     "vignette_url": vignette_url,
                 }
+            self._remember_door_event(self.data[DATA_LAST_EVENT])
 
             # Whether an RTC offer preceded this push decides who has already
             # announced the ring: the offer path dispatches the signal itself,
             # so re-sending it there would only restart the auto-off timer.
-            announced_by_rtc_offer = bool(self._active_call)
-            calling_module_id = calling_module_id or self._resolve_calling_module()
-            if calling_module_id:
-                if not announced_by_rtc_offer and not self._is_session_recently_closed(extra_params.get("session_id")):
+            if ring_module:
+                if not announced_by_rtc_offer and not session_closed:
                     # No offer arrived, so this push is the only notice of the
                     # ring we will get — without this the binary_sensor and the
                     # event entity never fire at all (#67, #58).
-                    self._answered_modules.discard(calling_module_id)
-                    async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, True, calling_module_id)
+                    self._answered_modules.discard(ring_module)
+                    async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, True, ring_module)
                 self._fire_call_event(
                     "ring",
-                    calling_module_id,
+                    ring_module,
                     snapshot_url=snapshot_url,
                     vignette_url=vignette_url,
                     session_id=extra_params.get("session_id"),
                 )
 
-            self.hass.bus.async_fire(
-                EVENT_LOGBOOK_INCOMING_CALL,
-                {"name": f"Incoming Call ({device_name})", "module_id": device_id},
-            )
+            self._fire_status_logbook(EVENT_LOGBOOK_INCOMING_CALL, "Incoming Call", device_id, module_id, subject_name)
 
             return True
 
@@ -756,7 +980,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             # Turn off binary sensor — device_id here is the bridge MAC, not the
             # external unit module_id, so resolve the unit that rang.
-            calling_module = None if call_was_over else self._resolve_calling_module()
+            calling_module = None if call_was_over else (calling_module_id or self._resolve_calling_module())
+            known_door = calling_module or (self._door_from_last_event(session_id) if call_was_over else None)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door)
             if calling_module:
                 async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module)
             self._active_call = None
@@ -765,16 +991,14 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                 "type": EVENT_TYPE_MISSED_CALL,
                 "timestamp": datetime.now(UTC),
                 "time": extra_params.get("timestamp"),
-                "module_id": device_id,
-                "module_name": device_name,
+                "module_id": module_id,
+                "module_name": subject_name,
                 "session_id": extra_params.get("session_id"),
                 "event_id": extra_params.get("event_id"),
             }
+            self._remember_door_event(self.data[DATA_LAST_EVENT])
 
-            self.hass.bus.async_fire(
-                EVENT_LOGBOOK_MISSED_CALL,
-                {"name": f"Missed Call ({device_name})", "module_id": device_id},
-            )
+            self._fire_status_logbook(EVENT_LOGBOOK_MISSED_CALL, "Missed Call", device_id, module_id, subject_name)
             await self._close_history_event(extra_params.get("session_id"), EVENT_TYPE_MISSED_CALL)
             return True
 
@@ -785,25 +1009,26 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # the WebRTC session may still be active on another device. When
             # the rescind came first, the call is already over and its
             # entities are off.
-            if not self._is_session_recently_closed(extra_params.get("session_id")):
-                calling_module = self._resolve_calling_module()
-                if calling_module:
-                    self.mark_call_answered(calling_module)
+            session_id = extra_params.get("session_id")
+            recently_closed = self._is_session_recently_closed(session_id)
+            answered = None if recently_closed else (calling_module_id or self._resolve_calling_module())
+            if answered:
+                self.mark_call_answered(answered)
+            known_door = answered or (self._door_from_last_event(session_id) if recently_closed else None)
+            module_id, subject_name = self._status_subject(device_id, door_id=known_door)
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_ACCEPTED_CALL,
                 "timestamp": datetime.now(UTC),
                 "time": extra_params.get("timestamp"),
-                "module_id": device_id,
-                "module_name": device_name,
+                "module_id": module_id,
+                "module_name": subject_name,
                 "session_id": extra_params.get("session_id"),
                 "event_id": extra_params.get("event_id"),
             }
+            self._remember_door_event(self.data[DATA_LAST_EVENT])
 
-            self.hass.bus.async_fire(
-                EVENT_LOGBOOK_ACCEPTED_CALL,
-                {"name": f"Call Accepted ({device_name})", "module_id": device_id},
-            )
+            self._fire_status_logbook(EVENT_LOGBOOK_ACCEPTED_CALL, "Call Accepted", device_id, module_id, subject_name)
             # Without this the record keeps the "incoming_call" it was created
             # with, and every answered call still reads as missed in the history.
             await self._close_history_event(extra_params.get("session_id"), EVENT_TYPE_ANSWERED_ELSEWHERE)
@@ -835,6 +1060,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             "session_id": extra_params.get("session_id"),
             "subevents": subevents_data,
         }
+        self._remember_door_event(self.data[DATA_LAST_EVENT])
 
     async def _close_history_event(self, event_id: str | None, event_type: str) -> None:
         """Close the history record for the given session id."""

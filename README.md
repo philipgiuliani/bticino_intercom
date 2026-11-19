@@ -40,19 +40,52 @@ Communicates with the BTicino/Netatmo cloud API via the [pybticino](https://gith
 
 | Entity type | What it does |
 |---|---|
-| **Camera** | WebRTC live video streaming and event snapshots. One entity per external unit. |
-| **Event** | Doorbell ring detection (`EventDeviceClass.DOORBELL`). Fires on incoming calls. |
+| **Camera** | WebRTC live video, one entity per external unit, plus a last-snapshot camera per door. |
+| **Event** | Doorbell ring detection (`EventDeviceClass.DOORBELL`), one entity per door. Event data includes `module_id` and `module_name`. |
 | **Lock** | Control door locks (BNDL modules). Open/close with optimistic state and automatic relock timer. |
-| **Binary Sensor** | Real-time incoming call detection (BNEU external units). Auto-off after 30 seconds. |
-| **Sensor — Last Event** | Shows the last call event type (incoming, answered elsewhere, terminated) with timestamp and snapshot URLs. |
-| **Sensor — Last Call Timestamp** | Timestamp sensor for the most recent completed call. |
+| **Binary Sensor** | Real-time incoming call detection (BNEU external units). Auto-off after 30 seconds. Attributes include `module_id` and `module_name`. |
+| **Sensor — Last Event** | Whole-home last call event type (incoming, answered elsewhere, terminated) with timestamp, snapshot URLs, `module_id` and `module_name`. |
+| **Sensor — `{door} Last Event`** | Same as Last Event, but only for that outdoor station. A ring at another door does not change it. |
+| **Sensor — Last Call Timestamp** | Timestamp of the most recent completed call, whichever door it was. |
+| **Sensor — `{door} Last Ring`** | Timestamp of the last ring at that door. |
 | **Sensor — Bridge Diagnostics** | Uptime, WiFi strength, WebSocket status, local IP, last seen, last config update. |
+| **Camera — Last Event Snapshot** | Still image of the most recent ring, whichever door it was. Attributes `module_id` and `module_name` say which one. |
+| **Camera — `{door} Last Snapshot`** | Still image of that door's last ring. Stays put when another door rings. |
 | **Light** | Staircase lights (BNSL modules, or BNVL on the 344742). On/off control. |
 | **Select — Do Not Disturb** | Classe 300X (BNC3) only. Ringtone mode, as in the Home + Security app: ringtone on, temporarily muted, always muted. |
 | **Number — Do Not Disturb Duration** | Classe 300X (BNC3) only. How many minutes "temporarily muted" lasts (default 60). |
 | **Switch / Number — Professional Studio** | Classe 300X (BNC3) only, when Professional Studio is configured on the device. |
 
 Entities also carry a `module_id` attribute. The camera and the doorbell of the same external unit share it, so a card can tell which camera belongs to which doorbell when there are several entrances.
+
+Door names come from the Home + Security app (the external unit's name, for example `Haustür`). The original whole-home entities (`Last Event Type`, `Last Call Timestamp`, `Last Event Snapshot`) are unchanged, so existing automations keep working.
+
+### Several outdoor stations
+
+Each outdoor station is a BNEU module. The cloud identifies it in two places:
+
+- **RTC offer** (`session_description.module_id`) when someone rings. This is what a Classe 100X/300X sends, so the per-door entities update immediately.
+- **Event history** (`events[].module_id`) on the regular poll. A status push (`incoming_call` / `missed_call` / `accepted_call`) only carries the bridge MAC. If no offer preceded it and the home has more than one station, the integration does not guess; the next history poll files the call under the right door. A home with a single station is attributed to that station straight away.
+
+Trigger on the door's own doorbell event (the entity is already that door), and attach that door's snapshot:
+
+```yaml
+triggers:
+  - trigger: event.received
+    target:
+      entity_id: event.haustur
+    options:
+      event_type:
+        - ring
+actions:
+  - action: notify.mobile_app_phone
+    data:
+      message: "Someone is at {{ state_attr('event.haustur', 'module_name') }}"
+      data:
+        image: /api/camera_proxy/camera.haustur_last_snapshot
+```
+
+`event.haustur` and `camera.haustur_last_snapshot` are examples — use the entity ids Home Assistant generated from your station names. The fired event also carries `module_id` and `module_name`. The whole-home `bticino_intercom_call` bus event does too (`module_id`, `module_name`), and its `camera_entity_id` is that door's live camera.
 
 ### Real-time events
 
@@ -65,6 +98,8 @@ The integration fires these events on the Home Assistant bus, for automations an
 - `bticino_intercom_call`: one event when a call rings (`type: ring`, with the snapshot and the camera entity) and one when it ends (`type: end`, with a `reason`)
 
 The `bticino_intercom.reject_call` action ends the ringing call on every device.
+
+On a status push (`incoming_call`, `missed_call`, `accepted_call`), `module_id` stays the bridge id from the cloud, which is what existing automations match. When the outdoor station is known, the same event also includes `door_id` and `door_name`. RTC logbook events already put the calling station in `module_id`.
 
 ### Automation Blueprints
 
